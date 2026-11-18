@@ -1,4 +1,4 @@
-name: Build APK
+name: Build APK Lite
 on:
   push:
   workflow_dispatch:
@@ -7,37 +7,340 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Organizar arquivos
+      - name: Criar projeto Lite
         run: |
-          P=app/src/main/java/com/lucas/catsbot
-          mkdir -p $P app/src/main/res/xml app/src/main/res/values
-          mv -f AndroidManifest.xml app/src/main/ 2>/dev/null || true
-          mv -f *.kt $P/ 2>/dev/null || true
-          mv -f accessibility_config.xml app/src/main/res/xml/ 2>/dev/null || true
-          mv -f strings.xml app/src/main/res/values/ 2>/dev/null || true
-          cat > settings.gradle.kts <<'EOF'
-          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
-          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
-          rootProject.name = "CatsBot"
-          include(":app")
-          EOF
-          cat > build.gradle.kts <<'EOF'
-          plugins {
-              id("com.android.application") version "8.5.2" apply false
-              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
-          }
-          EOF
-          cat > app/build.gradle.kts <<'EOF'
+          mkdir -p lite && cd lite
+          mkdir -p app
+          cat > app/build.gradle.kts <<'FIMARQ'
           plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
           android {
               namespace = "com.lucas.catsbot"
               compileSdk = 34
-              defaultConfig { applicationId = "com.lucas.catsbot"; minSdk = 30; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              defaultConfig { applicationId = "com.lucas.catsbot.lite"; minSdk = 24; targetSdk = 25; versionCode = 1; versionName = "1.0" }
               compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
               kotlinOptions { jvmTarget = "17" }
+              lint { abortOnError = false; checkReleaseBuilds = false }
           }
-          EOF
-          find . -path ./.git -prune -o -type f -print | sort
+          FIMARQ
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'FIMARQ'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <application android:label="CATS Bot Lite" android:usesCleartextTraffic="false">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".BotService" android:exported="false"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter>
+                      <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility_config"/>
+                  </service>
+              </application>
+          </manifest>
+          FIMARQ
+          mkdir -p app/src/main/java/com/lucas/catsbot
+          cat > app/src/main/java/com/lucas/catsbot/BotService.kt <<'FIMARQ'
+          package com.lucas.catsbot
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import kotlin.math.abs
+
+          object Cap { var code = 0; var data: Intent? = null }
+
+          class BotService : AccessibilityService() {
+              private lateinit var wm: WindowManager
+              private val h = Handler(Looper.getMainLooper())
+              private var running = false
+              private var tick = 0
+              private var lastOk = 0L
+              private var lastSeen = 0L
+              private var fails = 0
+              private var chests = 0
+              private var bar: View? = null
+              private lateinit var status: TextView
+              private var mp: MediaProjection? = null
+              private var reader: ImageReader? = null
+              private var vd: VirtualDisplay? = null
+              private var lastSig: IntArray? = null
+              private val names = listOf("botao FIGHT / Campeonato", "botao >> (pular luta)", "centro (bau / continuar)")
+
+              override fun onServiceConnected() { wm = getSystemService(WINDOW_SERVICE) as WindowManager; showBar() }
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+              override fun onDestroy() { running = false; bar?.let { wm.removeView(it) }; mp?.stop(); super.onDestroy() }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+
+              private fun showBar() {
+                  val l = LinearLayout(this).apply { setBackgroundColor(0xCC000000.toInt()); gravity = Gravity.CENTER_VERTICAL }
+                  status = TextView(this).apply { setTextColor(Color.WHITE); textSize = 11f; text = "parado" }
+                  l.addView(status)
+                  fun b(t: String, a: () -> Unit) = l.addView(Button(this).apply { text = t; textSize = 10f; setOnClickListener { a() } })
+                  b("Play/Pause") { toggle() }; b("Pontos") { calibrate() }; b("Ref bau") { saveRef() }
+                  val lp = WindowManager.LayoutParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL, PixelFormat.TRANSLUCENT)
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  wm.addView(l, lp); bar = l
+              }
+
+              // Captura de tela via MediaProjection (funciona no Android 7+). So guarda uma imagem pequena.
+              private fun startCapture(): Boolean {
+                  if (reader != null) return true
+                  val d = Cap.data ?: return false
+                  return try {
+                      val dm = resources.displayMetrics
+                      val w = 320
+                      val hh = (320f * dm.heightPixels / dm.widthPixels).toInt()
+                      val m = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                      val proj = m.getMediaProjection(Cap.code, d)
+                      val r = ImageReader.newInstance(w, hh, PixelFormat.RGBA_8888, 2)
+                      vd = proj.createVirtualDisplay("cap", w, hh, dm.densityDpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, r.surface, null, null)
+                      mp = proj; reader = r; true
+                  } catch (e: Exception) { toast("Falha na captura: ${e.javaClass.simpleName}"); false }
+              }
+
+              private fun grab(): IntArray? {
+                  val img = reader?.acquireLatestImage() ?: return lastSig
+                  try {
+                      val pl = img.planes[0]; val buf = pl.buffer; val rs = pl.rowStride; val ps = pl.pixelStride
+                      val w = img.width; val hh = img.height
+                      val out = IntArray(144) { i ->
+                          val x0 = (i % 16) * w / 16; val y0 = (i / 16) * hh / 9
+                          var sum = 0; var n = 0
+                          for (dy in 0 until 4) for (dx in 0 until 4) {
+                              val x = minOf(w - 1, x0 + dx * (w / 64)); val y = minOf(hh - 1, y0 + dy * (hh / 36))
+                              val o = y * rs + x * ps
+                              sum += (buf.get(o).toInt() and 255) * 3 + (buf.get(o + 1).toInt() and 255) * 6 + (buf.get(o + 2).toInt() and 255)
+                              n += 10
+                          }
+                          sum / n
+                      }
+                      lastSig = out
+                      return out
+                  } finally { img.close() }
+              }
+
+              private fun toggle() {
+                  running = !running
+                  if (running) {
+                      lastOk = System.currentTimeMillis(); fails = 0
+                      if (!startCapture()) toast("Sem captura de tela: so cliques, sem deteccao de derrota")
+                      if (Store.ref(this) == null) toast("Sem 'Ref bau': nao ha como detectar derrotas!")
+                      h.post(loop)
+                  }
+                  status.text = if (running) "rodando | baus: $chests" else "parado | baus: $chests"
+              }
+
+              private fun calibrate() {
+                  var i = 0
+                  val dm = resources.displayMetrics
+                  val v = View(this).apply { setBackgroundColor(0x33FFFF00) }
+                  toast("Toque em: ${names[0]}")
+                  v.setOnTouchListener { _, ev ->
+                      if (ev.action == MotionEvent.ACTION_DOWN) {
+                          Store.setPoint(this, i, ev.rawX / dm.widthPixels, ev.rawY / dm.heightPixels); i++
+                          if (i < 3) toast("Toque em: ${names[i]}") else { wm.removeView(v); toast("Pontos salvos") }
+                      }
+                      true
+                  }
+                  wm.addView(v, WindowManager.LayoutParams(-1, -1, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT))
+              }
+
+              private val loop = object : Runnable {
+                  override fun run() {
+                      if (!running) return
+                      val dm = resources.displayMetrics
+                      val p = Store.point(this@BotService, tick % 3); tick++
+                      tap(p.first * dm.widthPixels, p.second * dm.heightPixels)
+                      grab()?.let { onSig(it) }
+                      h.postDelayed(this, 1200)
+                  }
+              }
+
+              private fun tap(x: Float, y: Float) {
+                  val path = Path().apply { moveTo(x, y) }
+                  dispatchGesture(GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path, 0, 60)).build(), null, null)
+              }
+
+              private fun saveRef() {
+                  if (!startCapture()) { toast("Permita a captura de tela no app primeiro"); return }
+                  h.postDelayed({
+                      val s = grab()
+                      if (s != null) { Store.setRef(this, s); toast("Referencia do bau salva") } else toast("Sem imagem, tente de novo")
+                  }, 800)
+              }
+
+              private fun onSig(sig: IntArray) {
+                  if (!running) return
+                  val ref = Store.ref(this) ?: return
+                  val now = System.currentTimeMillis()
+                  val diff = ref.indices.sumOf { abs(ref[it] - sig[it]) } / 144
+                  if (diff < 22) {
+                      if (now - lastSeen > 20000) chests++
+                      lastSeen = now; lastOk = now; fails = 0
+                  } else if (now - lastOk > Store.timeoutMin(this) * 60000L) {
+                      fails++; lastOk = now
+                      val lim = Store.limit(this)
+                      if (fails >= lim && fails % lim == 0)
+                          Notifier.send(Store.topic(this), "CATS Bot", "${Store.name(this)}: perdendo em loop! $fails campeonatos sem bau.")
+                  }
+                  status.text = "rodando | baus: $chests | falhas: $fails"
+              }
+          }
+          FIMARQ
+          mkdir -p app/src/main/java/com/lucas/catsbot
+          cat > app/src/main/java/com/lucas/catsbot/MainActivity.kt <<'FIMARQ'
+          package com.lucas.catsbot
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.media.projection.MediaProjectionManager
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  val l = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 40, 40, 40) }
+                  fun t(x: String) = l.addView(TextView(this).apply { text = x; textSize = 15f })
+                  fun e(hint: String, v: String, num: Boolean = false) = EditText(this).apply {
+                      this.hint = hint; setText(v); if (num) inputType = InputType.TYPE_CLASS_NUMBER
+                  }.also { l.addView(it) }
+                  fun b(x: String, a: () -> Unit) = l.addView(Button(this).apply { text = x; setOnClickListener { a() } })
+
+                  t("USUARIO (mesmo nome + chave no app ntfy do seu celular)")
+                  val name = e("Nome (ex: lucas)", Store.name(this))
+                  val key = e("Chave secreta (ex: x7k2q9)", Store.key(this))
+                  val lim = e("Alertar apos N campeonatos sem bau", Store.limit(this).toString(), true)
+                  val tm = e("Minutos max. por campeonato", Store.timeoutMin(this).toString(), true)
+                  val info = TextView(this); l.addView(info)
+                  fun refresh() { info.text = "Topico: ${Store.topic(this)}" }
+                  refresh()
+                  b("Salvar usuario / config") {
+                      Store.save(this, name.text.toString().trim(), key.text.toString().trim())
+                      Store.setLimits(this, lim.text.toString().toIntOrNull() ?: 3, tm.text.toString().toIntOrNull() ?: 8)
+                      refresh(); Toast.makeText(this, "Salvo", Toast.LENGTH_SHORT).show()
+                  }
+                  b("Enviar alerta de teste") { Notifier.send(Store.topic(this), "CATS Bot", "Teste de alerta de ${Store.name(this)}") }
+                  t("\n1. Ative o servico de Acessibilidade")
+                  b("Abrir Acessibilidade") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  t("2. Permita a captura de tela (necessario para detectar derrotas)")
+                  b("Permitir captura de tela") {
+                      val m = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                      startActivityForResult(m.createScreenCaptureIntent(), 1)
+                  }
+                  t("3. Abra o jogo, use 'Pontos' e 'Ref bau' no overlay, depois Play.")
+                  setContentView(ScrollView(this).apply { addView(l) })
+              }
+
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(req, res, data)
+                  if (req == 1 && res == RESULT_OK && data != null) {
+                      Cap.code = res; Cap.data = data
+                      Toast.makeText(this, "Captura permitida", Toast.LENGTH_SHORT).show()
+                  } else if (req == 1) Toast.makeText(this, "Captura negada", Toast.LENGTH_SHORT).show()
+              }
+          }
+          FIMARQ
+          mkdir -p app/src/main/java/com/lucas/catsbot
+          cat > app/src/main/java/com/lucas/catsbot/Notifier.kt <<'FIMARQ'
+          package com.lucas.catsbot
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          object Notifier {
+              fun send(topic: String, title: String, msg: String) = Thread {
+                  try {
+                      val c = URL("https://ntfy.sh/$topic").openConnection() as HttpURLConnection
+                      c.requestMethod = "POST"; c.doOutput = true
+                      c.setRequestProperty("Title", title)
+                      c.outputStream.use { it.write(msg.toByteArray()) }
+                      c.responseCode; c.disconnect()
+                  } catch (_: Exception) {}
+              }.start()
+          }
+          FIMARQ
+          mkdir -p app/src/main/java/com/lucas/catsbot
+          cat > app/src/main/java/com/lucas/catsbot/Store.kt <<'FIMARQ'
+          package com.lucas.catsbot
+          import android.content.Context
+
+          object Store {
+              private fun sp(c: Context) = c.getSharedPreferences("cfg", Context.MODE_PRIVATE)
+              fun name(c: Context) = sp(c).getString("name", "") ?: ""
+              fun key(c: Context) = sp(c).getString("key", "") ?: ""
+              fun save(c: Context, name: String, key: String) = sp(c).edit().putString("name", name).putString("key", key).apply()
+              fun topic(c: Context) = "catsbot-" + name(c).lowercase().filter { it.isLetterOrDigit() } + "-" + key(c).filter { it.isLetterOrDigit() }
+              fun limit(c: Context) = sp(c).getInt("limit", 3)
+              fun timeoutMin(c: Context) = sp(c).getInt("tmin", 8)
+              fun setLimits(c: Context, limit: Int, tmin: Int) = sp(c).edit().putInt("limit", limit).putInt("tmin", tmin).apply()
+              private val defX = floatArrayOf(0.90f, 0.97f, 0.50f)
+              private val defY = floatArrayOf(0.93f, 0.93f, 0.50f)
+              fun point(c: Context, i: Int) = Pair(sp(c).getFloat("x$i", defX[i]), sp(c).getFloat("y$i", defY[i]))
+              fun setPoint(c: Context, i: Int, x: Float, y: Float) = sp(c).edit().putFloat("x$i", x).putFloat("y$i", y).apply()
+              fun ref(c: Context): IntArray? = sp(c).getString("ref", null)?.split(",")?.map { it.toInt() }?.toIntArray()
+              fun setRef(c: Context, r: IntArray) = sp(c).edit().putString("ref", r.joinToString(",")).apply()
+          }
+          FIMARQ
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'FIMARQ'
+          <resources>
+              <string name="svc_desc">Faz toques automaticos para o CATS Bot Lite.</string>
+          </resources>
+          FIMARQ
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'FIMARQ'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:description="@string/svc_desc"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:notificationTimeout="500"/>
+          FIMARQ
+          true
+          cat > build.gradle.kts <<'FIMARQ'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          FIMARQ
+          true
+          cat > settings.gradle.kts <<'FIMARQ'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "CatsBotLite"
+          include(":app")
+          FIMARQ
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -46,8 +349,9 @@ jobs:
         with:
           gradle-version: 8.7
       - name: Build debug APK
+        working-directory: lite
         run: gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
         with:
-          name: CatsBot-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: CatsBotLite-apk
+          path: lite/app/build/outputs/apk/debug/app-debug.apk
